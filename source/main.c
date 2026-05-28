@@ -22,6 +22,10 @@
 #define _countof_1(a) (_countof(a) - 1)
 #endif
 
+#if !defined(sizeof_1)
+#define sizeof_1(s) (sizeof(s) - 1)
+#endif
+
 #if !defined(FILE_FUNC_LINE)
 #define FILE_FUNC_LINE \
     __FILE__           \
@@ -40,7 +44,7 @@
     }
 #define perror_on_non_zero(e, v) perror_on_cond(e, v, v != 0, #e)
 
-static void notify(const char* fmt, ...)
+static void notify_(const char* fn, const char* fmt, ...)
 {
     struct notify_request
     {
@@ -59,9 +63,11 @@ static void notify(const char* fmt, ...)
         buf.message[--len] = '\0';
     }
     extern int sceKernelSendNotificationRequest(const size_t, const struct notify_request*, const size_t, const int);
-    puts(buf.message);
+    printf("%s: %s\n", fn, buf.message);
     sceKernelSendNotificationRequest(0, &buf, sizeof(buf), 0);
 }
+
+#define notify(...) notify_(FILE_FUNC_LINE, __VA_ARGS__)
 
 #define MAX_KCHUNK 2048
 
@@ -109,8 +115,8 @@ static int get_firmware_version_from_disk1(uint32_t* out, const bool want_ps4)
 {
     void* sce_proc_param = 0;
     int r = 0;
-    const uint32_t libkernel_sys = 0x1;
-    perror_on_non_zero(r = dynlib_get_obj_member(libkernel_sys, 8, &sce_proc_param), r);
+    const uint32_t module = 0x2;
+    perror_on_non_zero(r = dynlib_get_obj_member(module, 8, &sce_proc_param), r);
     if (r || !sce_proc_param)
     {
         return -__LINE__;
@@ -126,69 +132,99 @@ static int get_firmware_version_from_disk1(uint32_t* out, const bool want_ps4)
     return 0;
 }
 
-const uint32_t fw_max = 0x99999999;
-
-static void patch_fw(const uint32_t fw, const char* fw_n, const bool upd)
+static void get_ver_(const char* fn, const bool display, const char* pf, const char* mibn, uint32_t* out)
 {
-    printf("fw 0x%08x\n", fw);
-    const uint32_t fw_m[] = {fw_max};
-    const uint32_t fw_a[] = {fw, 0x10001};
-    const uintptr_t fw_addr = kernel_scan(
-        KERNEL_ADDRESS_DATA_BASE,
-        0,
-        fw_a,
-        upd ? sizeof(fw_a) : sizeof(uint32_t));
-
-    if (!fw_addr)
-    {
-        notify("%s firmware version not found in kernel data\n", fw_n);
-        return;
-    }
-    printf("firmware %s 0x%08x found in kernel 0x%lx\n",
-           fw_n,
-           fw,
-           fw_addr - KERNEL_ADDRESS_DATA_BASE);
-    kernel_copyin(fw_m, fw_addr, sizeof(fw_m));
-    uint32_t fw_p = 0;
-    kernel_copyout(fw_addr, &fw_p, sizeof(fw_p));
-    printf("%s patched to 0x%08x\n", fw_n, fw_p);
-}
-
-static void get_ver(const char* pf, const char* mibn, uint32_t* out)
-{
-    size_t len = 4;
+    size_t len = sizeof(*out);
     *out = 0;
     sysctlbyname(mibn, out, &len, NULL, 0);
-    notify("%s%s: 0x%08x\n", pf, mibn, *out);
+    if (display)
+    {
+        notify_(fn, "%s%s: 0x%08x\n", pf, mibn, *out);
+    }
+}
+
+#define get_ver(d, pf, m, o) get_ver_(FILE_FUNC_LINE, d, pf, m, o)
+#define get_ver_hide(pf, m, o) get_ver(false, pf, m, o)
+#define get_ver_show(pf, m, o) get_ver(true, pf, m, o)
+
+// assume only 1 ref, should be okay. nyahuhuhu
+static uintptr_t kernel_scan_strref(const uintptr_t base, const size_t limit, const void* s, const size_t slen)
+{
+    uintptr_t str_addr = kernel_scan(base, limit, s, slen);
+    if (!str_addr)
+    {
+        return 0;
+    }
+    str_addr += 1;
+    return kernel_scan(base, limit, &str_addr, sizeof(str_addr));
+}
+
+static uintptr_t kernel_scan_near(const uintptr_t addr, const size_t range, const void* needle, const size_t nlen)
+{
+    const uintptr_t base = addr > range ? addr - range : 0;
+    const size_t limit = range * 2;
+    return kernel_scan(base, limit, needle, nlen);
+}
+
+static const uint32_t fw_max = 0x99999999;
+
+static void write_fw(const uintptr_t psdk)
+{
+    uint32_t v = kernel_getint(psdk);
+    if (v == fw_max)
+    {
+        printf("0x%lx same\n", psdk);
+        return;
+    }
+    printf("0x%lx 0x%08x ", psdk, v);
+    kernel_setint(psdk, fw_max);
+    v = kernel_getint(psdk);
+    printf("-> 0x%08x\n", v);
+}
+
+static void patch_fw(void)
+{
+#define strsz(s) s, sizeof_1(s)
+    uintptr_t sdk_ver = kernel_scan_strref(KERNEL_ADDRESS_DATA_BASE, 0, strsz("\0ps4_sdk_version\0"));
+    if (sdk_ver)
+    {
+        write_fw(sdk_ver - 8);
+    }
+    uint32_t upd_version = 0;
+    get_ver_hide("before: ", "machdep.upd_version", &upd_version);
+    sdk_ver = kernel_scan_near(KERNEL_ADDRESS_SECURITY_FLAGS, 4096, &upd_version, sizeof(upd_version));
+    if (sdk_ver)
+    {
+        write_fw(sdk_ver);
+    }
+    return;
+    sdk_ver = kernel_scan_strref(KERNEL_ADDRESS_DATA_BASE, 0, strsz("\0sdk_version\0"));
+    if (sdk_ver)
+    {
+        write_fw(sdk_ver - 8);
+    }
 }
 
 int main(void)
 {
-    uint32_t fw = 0;
-    uint32_t fw2 = 0;
-    get_firmware_version_from_disk1(&fw, true);
-    get_firmware_version_from_disk1(&fw2, false);
-    uint32_t ps4_sdk = 0;
-    get_ver("before: ", "kern.ps4_sdk_version", &ps4_sdk);
-    if (ps4_sdk != fw_max)
+    // all vars must be 0, otherwise you'll undesirable consequences nyahuhu
+    struct d
     {
-        patch_fw(fw, "PS4 SDK", false);
-    }
-    uint32_t ps5_sdk = 0;
-    get_ver("before: ", "kern.sdk_version", &ps5_sdk);
-    if (0 && ps5_sdk != fw_max)
-    {
-        patch_fw(fw2, "PS5 SDK", false);
-        patch_fw(fw2, "PS5 SDK", false);
-    }
-    uint32_t upd_version = 0;
-    get_ver("before: ", "machdep.upd_version", &upd_version);
-    if (upd_version != fw_max)
-    {
-        patch_fw(upd_version, "PS5 Update", true);
-    }
-    get_ver("after: ", "kern.ps4_sdk_version", &ps4_sdk);
-    get_ver("after: ", "kern.sdk_version", &ps5_sdk);
-    get_ver("after: ", "machdep.upd_version", &upd_version);
+        uint32_t fw_ps4, fw_ps5, temp;
+    } d = {};
+    get_firmware_version_from_disk1(&d.fw_ps4, true);
+    get_firmware_version_from_disk1(&d.fw_ps5, false);
+    notify(
+        "real ps4 sdk 0x%08x\n"
+        "real ps5 sdk 0x%08x\n",
+        d.fw_ps4,
+        d.fw_ps5);
+    get_ver_show("before ", "kern.ps4_sdk_version", &d.temp);
+    get_ver_show("before ", "kern.sdk_version", &d.temp);
+    get_ver_show("before ", "machdep.upd_version", &d.temp);
+    patch_fw();
+    get_ver_show("after ", "kern.ps4_sdk_version", &d.temp);
+    get_ver_show("after ", "kern.sdk_version", &d.temp);
+    get_ver_show("after ", "machdep.upd_version", &d.temp);
     return 0;
 }
