@@ -34,10 +34,10 @@ jobs:
       run: |
         clang -v
         cmake --version
-        echo cwd="${PWD##*/}" >> ${{ github.env }}
+        echo "cwd=${PWD##*/}" >> $GITHUB_ENV
 
     - name: Set environment variables
-      run: echo "PS5_PAYLOAD_SDK=${{ runner.tool_cache }}/opt/ps5-payload-sdk" >> ${{ github.env }}
+      run: echo "PS5_PAYLOAD_SDK=${{ runner.tool_cache }}/opt/ps5-payload-sdk" >> $GITHUB_ENV
 
     - name: Install PS5 SDK
       run: |
@@ -50,33 +50,54 @@ jobs:
       uses: actions/checkout@main
       with:
         repository: ps5-payload-dev/sdk
+        path: sdk-temp
 
     - name: Install update PS5 SDK
-      run: make "DESTDIR=${{ env.PS5_PAYLOAD_SDK }}" clean install -j "$(nproc)"
+      run: |
+        cd sdk-temp
+        make "DESTDIR=${{ env.PS5_PAYLOAD_SDK }}" clean install -j "$(nproc)"
 
     - name: Checkout Payload
       uses: actions/checkout@main
 
     - name: Build PS5 Payloads
       run: |
-        p="$PWD" # define p so it can be copypasted into shell
+        p="$PWD"
         b="$p/build_ps5"
         $PS5_PAYLOAD_SDK/bin/prospero-cmake -B "$b" -DCMAKE_VERBOSE_MAKEFILE=OFF --fresh
         $PS5_PAYLOAD_SDK/bin/prospero-cmake --build "$b" -j "$(nproc)"
 
-    - name: Upload ${{ env.cwd }}
-      if: 0
-      uses: actions/upload-artifact@main
+    - name: List build artifacts
+      run: |
+        echo "Build directory contents:"
+        ls -la build_ps5/
+        echo "Looking for .elf files:"
+        find build_ps5/ -name "*.elf" -type f
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ env.cwd }}
-        path: build_ps5/${{ env.cwd }}.elf
-        archive: false
-        retention-days: 1
+        path: build_ps5/*.elf
+        if-no-files-found: error
+        retention-days: 7
 
     - name: Upload release
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        # 查找所有.elf文件
+        ELF_FILES=$(find build_ps5/ -name "*.elf" -type f)
+        if [ -z "$ELF_FILES" ]; then
+          echo "No .elf files found to upload!"
+          exit 1
+        fi
+        
+        # 创建release（如果不存在）
         gh release create "${{ github.run_id }}" \
-        build_ps5/${{ env.cwd }}.elf \
-        --target "${{ GITHUB.SHA }}" -t "${{ github.run_id }}" -p
+          $ELF_FILES \
+          --target "${{ github.sha }}" \
+          --title "Build ${{ github.run_id }}" \
+          --notes "Automated build from commit ${{ github.sha }}" \
+          --prerelease || true
